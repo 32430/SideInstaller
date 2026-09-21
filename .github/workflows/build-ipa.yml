@@ -11,24 +11,102 @@ permissions:
 
 jobs:
   build:
-    name: Build unsigned IPA
+    name: Build SideInstaller IPA
     runs-on: macos-26
 
     steps:
+      # ========================================
+      # Checkout
+      # ========================================
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Show tool versions
+      # ========================================
+      # Select Xcode
+      # ========================================
+      - name: Select Xcode
+        shell: bash
         run: |
-          xcodebuild -version
-          swift --version
-          rustc --version || true
-          cargo --version || true
+          set -euo pipefail
 
-      - name: Install Homebrew dependencies
+          echo "Searching for installed Xcode..."
+
+          XCODE_APP="$(
+            find /Applications \
+              -maxdepth 1 \
+              -name 'Xcode*.app' \
+              -print 2>/dev/null \
+              | sort -V \
+              | tail -n 1
+          )"
+
+          if [ -z "$XCODE_APP" ]; then
+            echo "ERROR: Xcode was not found."
+            echo
+            echo "Available Xcode installations:"
+            ls -la /Applications/Xcode*.app 2>/dev/null || true
+            exit 1
+          fi
+
+          XCODE_DIR="$XCODE_APP/Contents/Developer"
+
+          if [ ! -d "$XCODE_DIR" ]; then
+            echo "ERROR: Invalid Xcode developer directory:"
+            echo "$XCODE_DIR"
+            exit 1
+          fi
+
+          echo "Selected Xcode:"
+          echo "$XCODE_APP"
+
+          echo "Developer directory:"
+          echo "$XCODE_DIR"
+
+          echo "DEVELOPER_DIR=$XCODE_DIR" >> "$GITHUB_ENV"
+
+          export DEVELOPER_DIR="$XCODE_DIR"
+
+          echo
+          echo "Xcode version:"
+          xcodebuild -version
+
+          echo
+          echo "Xcode developer path:"
+          xcode-select -p
+
+          echo
+          echo "macOS SDK:"
+          xcrun --sdk macosx --show-sdk-path
+
+          echo
+          echo "iOS SDK:"
+          xcrun --sdk iphoneos --show-sdk-path
+
+      # ========================================
+      # Show environment
+      # ========================================
+      - name: Show environment
+        run: |
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR"
+          echo
+          swift --version
+          echo
+          xcodebuild -version
+
+      # ========================================
+      # Install XcodeGen
+      # ========================================
+      - name: Install XcodeGen
         run: |
           brew install xcodegen
 
+      - name: Check XcodeGen
+        run: |
+          xcodegen version
+
+      # ========================================
+      # Install Rust
+      # ========================================
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -36,17 +114,78 @@ jobs:
             aarch64-apple-ios
             aarch64-apple-ios-sim
 
-      - name: Build Rust core
+      # ========================================
+      # Check Rust
+      # ========================================
+      - name: Check Rust
         run: |
+          rustc --version
+          cargo --version
+          rustup show
+
+      # ========================================
+      # Build Rust core
+      # ========================================
+      - name: Build Rust core
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Building Rust core..."
+
+          if [ ! -f "./build-rust.sh" ]; then
+            echo "ERROR: build-rust.sh was not found."
+            exit 1
+          fi
+
           chmod +x ./build-rust.sh
           ./build-rust.sh
 
-      - name: Generate Xcode project
+      # ========================================
+      # Check Rust output
+      # ========================================
+      - name: Check Rust output
+        shell: bash
         run: |
+          echo "Searching for generated xcframework..."
+
+          find . \
+            -type d \
+            -name "*.xcframework" \
+            -print
+
+      # ========================================
+      # Generate Xcode project
+      # ========================================
+      - name: Generate Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "project.yml" ]; then
+            echo "ERROR: project.yml was not found."
+            exit 1
+          fi
+
           xcodegen generate
 
-      - name: Build iOS app
+      # ========================================
+      # Check generated project
+      # ========================================
+      - name: Check Xcode project
         run: |
+          ls -la
+          echo
+          find . -maxdepth 2 -name "*.xcodeproj" -print
+
+      # ========================================
+      # Build iOS application
+      # ========================================
+      - name: Build iOS app
+        shell: bash
+        run: |
+          set -euo pipefail
+
           xcodebuild \
             -project SideInstaller.xcodeproj \
             -scheme SideInstaller \
@@ -58,17 +197,72 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
-      - name: Package IPA
+      # ========================================
+      # Check .app
+      # ========================================
+      - name: Check built app
+        shell: bash
         run: |
+          set -euo pipefail
+
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app"
+
+          if [ ! -d "$APP_PATH" ]; then
+            echo "ERROR: SideInstaller.app was not found."
+            echo
+            echo "Available build products:"
+            find build/DerivedData/Build/Products \
+              -maxdepth 3 \
+              -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Found:"
+          echo "$APP_PATH"
+
+          ls -la "$APP_PATH"
+
+      # ========================================
+      # Create IPA
+      # ========================================
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app"
+
           mkdir -p build/Payload
 
-          cp -R \
-            build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app \
-            build/Payload/
+          cp -R "$APP_PATH" build/Payload/
 
           cd build
+
           zip -r SideInstaller-unsigned.ipa Payload
 
+      # ========================================
+      # Check IPA
+      # ========================================
+      - name: Check IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "build/SideInstaller-unsigned.ipa" ]; then
+            echo "ERROR: IPA was not created."
+            exit 1
+          fi
+
+          echo "IPA created successfully:"
+          ls -lh build/SideInstaller-unsigned.ipa
+
+          echo
+          echo "IPA contents:"
+          unzip -l build/SideInstaller-unsigned.ipa
+
+      # ========================================
+      # Upload IPA artifact
+      # ========================================
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
@@ -76,6 +270,9 @@ jobs:
           path: build/SideInstaller-unsigned.ipa
           if-no-files-found: error
 
+      # ========================================
+      # Upload .app artifact
+      # ========================================
       - name: Upload app bundle
         uses: actions/upload-artifact@v4
         with:
