@@ -1,4 +1,4 @@
-name: Build SideInstaller (SideStore Ready)
+name: Debug Repository Structure
 
 on:
   push:
@@ -6,58 +6,16 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  debug_files:
     runs-on: macos-14
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Xcode version
-      run: sudo xcode-select -s /Applications/Xcode_15.4.app
-
-    - name: Find Project and Build
+    - name: List all files
       run: |
-        # プロジェクトファイル(.xcodeproj または .xcworkspace)を検索
-        WORKSPACE_PATH=$(find . -name "SideInstaller.xcworkspace" | head -n 1)
-        PROJECT_PATH=$(find . -name "SideInstaller.xcodeproj" | head -n 1)
-        
-        mkdir -p $GITHUB_WORKSPACE/build
-        
-        if [ -n "$WORKSPACE_PATH" ]; then
-          echo "Found workspace at $WORKSPACE_PATH"
-          xcodebuild archive \
-            -workspace "$WORKSPACE_PATH" \
-            -scheme "SideInstaller" \
-            -configuration Release \
-            -archivePath $GITHUB_WORKSPACE/build/SideInstaller.xcarchive \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
-        elif [ -n "$PROJECT_PATH" ]; then
-          echo "Found project at $PROJECT_PATH"
-          xcodebuild archive \
-            -project "$PROJECT_PATH" \
-            -scheme "SideInstaller" \
-            -configuration Release \
-            -archivePath $GITHUB_WORKSPACE/build/SideInstaller.xcarchive \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
-        else
-          echo "Error: SideInstaller project file not found!"
-          exit 1
-        fi
-
-    - name: Create Unsigned IPA
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/build/Payload
-        mv $GITHUB_WORKSPACE/build/SideInstaller.xcarchive/Products/Applications/*.app $GITHUB_WORKSPACE/build/Payload/
-        cd $GITHUB_WORKSPACE/build
-        zip -r SideInstaller_unsigned.ipa Payload
-
-    - name: Upload IPA Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: SideInstaller_unsigned
-        path: ${{ github.workspace }}/build/SideInstaller_unsigned.ipa
+        echo "=== Current Directory ==="
+        pwd
+        echo "=== List of Files ==="
+        find . -maxdepth 3 -not -path '*/.*'
