@@ -35,7 +35,7 @@ jobs:
         zip -r SideInstaller_unsigned.ipa Payload
 
     - name: Upload IPA Artifact
-      uses: actions/artifacts@v4
+      uses: actions/upload-artifact@v4
       with:
         name: SideInstaller_unsigned
         path: ${{ github.workspace }}/build/SideInstaller_unsigned.ipa
