@@ -1,0 +1,84 @@
+name: Build SideInstaller IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Show tool versions
+        run: |
+          xcodebuild -version
+          swift --version
+          rustc --version || true
+          cargo --version || true
+
+      - name: Install Homebrew dependencies
+        run: |
+          brew install xcodegen
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            aarch64-apple-ios
+            aarch64-apple-ios-sim
+
+      - name: Build Rust core
+        run: |
+          chmod +x ./build-rust.sh
+          ./build-rust.sh
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+
+      - name: Build iOS app
+        run: |
+          xcodebuild \
+            -project SideInstaller.xcodeproj \
+            -scheme SideInstaller \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package IPA
+        run: |
+          mkdir -p build/Payload
+
+          cp -R \
+            build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app \
+            build/Payload/
+
+          cd build
+          zip -r SideInstaller-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideInstaller-unsigned-ipa
+          path: build/SideInstaller-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideInstaller-app
+          path: build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app
+          if-no-files-found: error
