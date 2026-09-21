@@ -67,19 +67,19 @@ jobs:
           export DEVELOPER_DIR="$XCODE_DIR"
 
           echo
-          echo "Xcode version:"
+          echo "=== Xcode ==="
           xcodebuild -version
 
           echo
-          echo "Xcode developer path:"
+          echo "=== Developer directory ==="
           xcode-select -p
 
           echo
-          echo "macOS SDK:"
+          echo "=== macOS SDK ==="
           xcrun --sdk macosx --show-sdk-path
 
           echo
-          echo "iOS SDK:"
+          echo "=== iOS SDK ==="
           xcrun --sdk iphoneos --show-sdk-path
 
       # ========================================
@@ -89,8 +89,10 @@ jobs:
         run: |
           echo "DEVELOPER_DIR=$DEVELOPER_DIR"
           echo
+          echo "Swift:"
           swift --version
           echo
+          echo "Xcode:"
           xcodebuild -version
 
       # ========================================
@@ -147,7 +149,7 @@ jobs:
       - name: Check Rust output
         shell: bash
         run: |
-          echo "Searching for generated xcframework..."
+          echo "Searching for generated XCFrameworks..."
 
           find . \
             -type d \
@@ -175,8 +177,13 @@ jobs:
       - name: Check Xcode project
         run: |
           ls -la
+
           echo
-          find . -maxdepth 2 -name "*.xcodeproj" -print
+          echo "Xcode projects:"
+          find . \
+            -maxdepth 3 \
+            -name "*.xcodeproj" \
+            -print
 
       # ========================================
       # Build iOS application
@@ -198,29 +205,105 @@ jobs:
             CODE_SIGN_IDENTITY=""
 
       # ========================================
-      # Check .app
+      # Locate app
+      # ========================================
+      - name: Locate built app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Searching for SideInstaller.app..."
+
+          find build \
+            -type d \
+            -name "SideInstaller.app" \
+            -print
+
+      # ========================================
+      # Inspect application
+      # ========================================
+      - name: Inspect application
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          APP="build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app"
+
+          if [ ! -d "$APP" ]; then
+            echo "ERROR: Application not found:"
+            echo "$APP"
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "APP INFORMATION"
+          echo "========================================"
+
+          echo
+          echo "Path:"
+          echo "$APP"
+
+          echo
+          echo "Files:"
+          find "$APP" -maxdepth 2 -print
+
+          echo
+          echo "========================================"
+          echo "CODE SIGNATURE"
+          echo "========================================"
+
+          codesign -dvvv "$APP" 2>&1 || true
+
+          echo
+          echo "========================================"
+          echo "ENTITLEMENTS"
+          echo "========================================"
+
+          codesign -d --entitlements :- "$APP" 2>&1 || true
+
+          echo
+          echo "========================================"
+          echo "PROVISIONING PROFILE"
+          echo "========================================"
+
+          if [ -f "$APP/embedded.mobileprovision" ]; then
+            echo "embedded.mobileprovision exists."
+
+            security cms \
+              -D \
+              -i "$APP/embedded.mobileprovision" \
+              2>&1 || true
+          else
+            echo "No embedded.mobileprovision found."
+          fi
+
+          echo
+          echo "========================================"
+          echo "INFO.PLIST"
+          echo "========================================"
+
+          /usr/libexec/PlistBuddy \
+            -c "Print" \
+            "$APP/Info.plist" \
+            2>&1 || true
+
+      # ========================================
+      # Check app
       # ========================================
       - name: Check built app
         shell: bash
         run: |
           set -euo pipefail
 
-          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app"
+          APP="build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app"
 
-          if [ ! -d "$APP_PATH" ]; then
+          if [ ! -d "$APP" ]; then
             echo "ERROR: SideInstaller.app was not found."
-            echo
-            echo "Available build products:"
-            find build/DerivedData/Build/Products \
-              -maxdepth 3 \
-              -print 2>/dev/null || true
             exit 1
           fi
 
-          echo "Found:"
-          echo "$APP_PATH"
-
-          ls -la "$APP_PATH"
+          echo "SideInstaller.app found:"
+          ls -lah "$APP"
 
       # ========================================
       # Create IPA
@@ -230,15 +313,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app"
+          APP="build/DerivedData/Build/Products/Release-iphoneos/SideInstaller.app"
 
           mkdir -p build/Payload
 
-          cp -R "$APP_PATH" build/Payload/
+          cp -R "$APP" build/Payload/
 
           cd build
 
-          zip -r SideInstaller-unsigned.ipa Payload
+          rm -f SideInstaller-unsigned.ipa
+
+          zip -r \
+            SideInstaller-unsigned.ipa \
+            Payload
 
       # ========================================
       # Check IPA
@@ -248,20 +335,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ ! -f "build/SideInstaller-unsigned.ipa" ]; then
+          IPA="build/SideInstaller-unsigned.ipa"
+
+          if [ ! -f "$IPA" ]; then
             echo "ERROR: IPA was not created."
             exit 1
           fi
 
-          echo "IPA created successfully:"
-          ls -lh build/SideInstaller-unsigned.ipa
+          echo "========================================"
+          echo "IPA CREATED"
+          echo "========================================"
+
+          ls -lh "$IPA"
 
           echo
-          echo "IPA contents:"
-          unzip -l build/SideInstaller-unsigned.ipa
+          echo "========================================"
+          echo "IPA CONTENTS"
+          echo "========================================"
+
+          unzip -l "$IPA"
 
       # ========================================
-      # Upload IPA artifact
+      # Upload IPA
       # ========================================
       - name: Upload IPA
         uses: actions/upload-artifact@v4
@@ -271,7 +366,7 @@ jobs:
           if-no-files-found: error
 
       # ========================================
-      # Upload .app artifact
+      # Upload APP
       # ========================================
       - name: Upload app bundle
         uses: actions/upload-artifact@v4
