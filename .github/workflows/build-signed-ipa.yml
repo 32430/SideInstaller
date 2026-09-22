@@ -1,0 +1,474 @@
+name: Build Signed SideInstaller IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    env:
+      BUNDLE_ID: com.frizzle.sideinstaller
+      APP_NAME: SideInstaller
+
+    steps:
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # Select installed Xcode automatically
+      # ------------------------------------------------------------
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          XCODE_APP="$(
+            find /Applications \
+              -maxdepth 1 \
+              -type d \
+              -name 'Xcode*.app' \
+              -print |
+            sort -V |
+            tail -n 1
+          )"
+
+          if [ -z "$XCODE_APP" ]; then
+            echo "No Xcode installation found."
+            exit 1
+          fi
+
+          echo "Using Xcode: $XCODE_APP"
+          echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------
+      # Rust
+      # ------------------------------------------------------------
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      # ------------------------------------------------------------
+      # XcodeGen
+      # ------------------------------------------------------------
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+
+      # ------------------------------------------------------------
+      # Build SideInstaller Rust core
+      # ------------------------------------------------------------
+      - name: Build Rust core
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x build-rust.sh
+          ./build-rust.sh
+
+      # ------------------------------------------------------------
+      # Generate Xcode project
+      # ------------------------------------------------------------
+      - name: Generate Xcode project
+        run: |
+          set -euo pipefail
+          xcodegen generate
+
+      # ------------------------------------------------------------
+      # Build unsigned archive
+      #
+      # We intentionally build unsigned here.
+      # SideSign performs the final signing afterward.
+      # ------------------------------------------------------------
+      - name: Build unsigned archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$RUNNER_TEMP/SideInstaller.xcarchive"
+
+          xcodebuild \
+            -project SideInstaller.xcodeproj \
+            -scheme SideInstaller \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/SideInstaller.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      # ------------------------------------------------------------
+      # Locate app
+      # ------------------------------------------------------------
+      - name: Locate SideInstaller.app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$RUNNER_TEMP/SideInstaller.xcarchive/Products/Applications/SideInstaller.app"
+
+          if [ ! -d "$APP_PATH" ]; then
+            echo "SideInstaller.app was not found:"
+            echo "$APP_PATH"
+            exit 1
+          fi
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+          ACTUAL_BUNDLE_ID="$(
+            /usr/libexec/PlistBuddy \
+              -c "Print :CFBundleIdentifier" \
+              "$APP_PATH/Info.plist"
+          )"
+
+          echo "Bundle ID: $ACTUAL_BUNDLE_ID"
+
+          if [ "$ACTUAL_BUNDLE_ID" != "$BUNDLE_ID" ]; then
+            echo "Unexpected bundle ID."
+            echo "Expected: $BUNDLE_ID"
+            echo "Actual:   $ACTUAL_BUNDLE_ID"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------
+      # Build SideSign
+      #
+      # Official SideSign build.sh creates ./sidesign
+      # ------------------------------------------------------------
+      - name: Build SideSign CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SIDESIGN_DIR="$RUNNER_TEMP/SideSign"
+
+          git clone \
+            --depth 1 \
+            https://github.com/SideStore/SideSign.git \
+            "$SIDESIGN_DIR"
+
+          cd "$SIDESIGN_DIR"
+
+          chmod +x build.sh
+          ./build.sh
+
+          test -x ./sidesign
+
+          echo "SIDESIGN=$SIDESIGN_DIR/sidesign" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------
+      # Decode P12
+      #
+      # SIDE_P12_B64 must contain Base64-encoded P12 data.
+      # ------------------------------------------------------------
+      - name: Restore P12
+        env:
+          SIDE_P12_B64: ${{ secrets.SIDE_P12_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          if [ -z "$SIDE_P12_B64" ]; then
+            echo "SIDE_P12_B64 is empty."
+            exit 1
+          fi
+
+          printf '%s' "$SIDE_P12_B64" \
+            | base64 -D \
+            > "$RUNNER_TEMP/SideStore.p12"
+
+          test -s "$RUNNER_TEMP/SideStore.p12"
+
+          echo "P12 restored successfully."
+
+      # ------------------------------------------------------------
+      # Validate P12 and determine Team ID
+      # ------------------------------------------------------------
+      - name: Validate P12
+        env:
+          SIDE_P12_PASSWORD: ${{ secrets.SIDE_P12_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          KEYCHAIN="$RUNNER_TEMP/sidesign.keychain-db"
+
+          security create-keychain \
+            -p "" \
+            "$KEYCHAIN"
+
+          security unlock-keychain \
+            -p "" \
+            "$KEYCHAIN"
+
+          security set-keychain-settings \
+            -lut 21600 \
+            "$KEYCHAIN"
+
+          security import \
+            "$RUNNER_TEMP/SideStore.p12" \
+            -k "$KEYCHAIN" \
+            -P "$SIDE_P12_PASSWORD" \
+            -T /usr/bin/security \
+            -T /usr/bin/codesign
+
+          security unlock-keychain \
+            -p "" \
+            "$KEYCHAIN"
+
+          IDENTITIES="$(
+            security find-identity \
+              -v \
+              -p codesigning \
+              "$KEYCHAIN"
+          )"
+
+          echo "$IDENTITIES"
+
+          IDENTITY="$(
+            printf '%s\n' "$IDENTITIES" |
+            grep -E '"(Apple Development|iPhone Developer):' |
+            head -n 1 |
+            sed 's/.*"\(.*\)".*/\1/'
+          )"
+
+          if [ -z "$IDENTITY" ]; then
+            echo
+            echo "No Apple Development/iPhone Developer certificate was found in the P12."
+            echo
+            echo "The P12 should contain a development signing certificate."
+            exit 1
+          fi
+
+          TEAM_ID="$(
+            printf '%s\n' "$IDENTITY" |
+            sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p'
+          )"
+
+          if [ -z "$TEAM_ID" ]; then
+            echo "Could not determine Team ID from certificate:"
+            echo "$IDENTITY"
+            exit 1
+          fi
+
+          echo "Signing identity: $IDENTITY"
+          echo "Team ID: $TEAM_ID"
+
+          echo "TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------
+      # Authenticate to Apple Developer through SideSign
+      #
+      # NOTE:
+      # First login may require Apple's 2FA interaction.
+      # A GitHub-hosted runner cannot type a fresh 2FA code interactively.
+      # ------------------------------------------------------------
+      - name: Sign in to Apple Developer
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$APPLE_ID" ]; then
+            echo "APPLE_ID secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$APPLE_PASSWORD" ]; then
+            echo "APPLE_PASSWORD secret is missing."
+            exit 1
+          fi
+
+          "$SIDESIGN" dev login \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD"
+
+      # ------------------------------------------------------------
+      # Select the team belonging to the P12
+      # ------------------------------------------------------------
+      - name: Select signing team
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          "$SIDESIGN" dev select-team-id "$TEAM_ID"
+
+      # ------------------------------------------------------------
+      # Make sure the App ID exists
+      # ------------------------------------------------------------
+      - name: Register App ID if necessary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking App IDs..."
+
+          APP_IDS="$(
+            "$SIDESIGN" dev appids list 2>&1
+          )"
+
+          printf '%s\n' "$APP_IDS"
+
+          if printf '%s\n' "$APP_IDS" | grep -Fq "$BUNDLE_ID"; then
+            echo "App ID already exists: $BUNDLE_ID"
+            exit 0
+          fi
+
+          echo "App ID does not exist. Registering it..."
+
+          "$SIDESIGN" dev appids register \
+            --name "$APP_NAME" \
+            --bundle-id "$BUNDLE_ID"
+
+      # ------------------------------------------------------------
+      # Obtain / generate Development Provisioning Profile
+      # ------------------------------------------------------------
+      - name: Obtain Provisioning Profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          PROFILE="$RUNNER_TEMP/SideInstaller.mobileprovision"
+
+          "$SIDESIGN" dev profiles download \
+            --bundle-id "$BUNDLE_ID" \
+            --output "$PROFILE"
+
+          if [ ! -s "$PROFILE" ]; then
+            echo "Provisioning Profile was not generated."
+            exit 1
+          fi
+
+          echo
+          echo "Provisioning Profile:"
+          "$SIDESIGN" profile validate "$PROFILE"
+
+          echo "PROFILE_PATH=$PROFILE" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------
+      # Package unsigned app to IPA
+      # ------------------------------------------------------------
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/Payload"
+
+          rm -rf "$RUNNER_TEMP/Payload/SideInstaller.app"
+
+          cp -R \
+            "$APP_PATH" \
+            "$RUNNER_TEMP/Payload/SideInstaller.app"
+
+          cd "$RUNNER_TEMP"
+
+          "$SIDESIGN" archive zip \
+            "$RUNNER_TEMP/Payload/SideInstaller.app" \
+            --output "$RUNNER_TEMP/SideInstaller-unsigned.ipa"
+
+          test -s "$RUNNER_TEMP/SideInstaller-unsigned.ipa"
+
+      # ------------------------------------------------------------
+      # Sign IPA with P12 + freshly obtained profile
+      # ------------------------------------------------------------
+      - name: Sign IPA
+        env:
+          SIDE_P12_PASSWORD: ${{ secrets.SIDE_P12_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          "$SIDESIGN" sign \
+            "$RUNNER_TEMP/SideInstaller-unsigned.ipa" \
+            --p12 "$RUNNER_TEMP/SideStore.p12" \
+            --password "$SIDE_P12_PASSWORD" \
+            --profile "$PROFILE_PATH" \
+            --using-team-id "$TEAM_ID" \
+            --output "$GITHUB_WORKSPACE/SideInstaller.ipa"
+
+          test -s "$GITHUB_WORKSPACE/SideInstaller.ipa"
+
+      # ------------------------------------------------------------
+      # Verify with SideSign
+      # ------------------------------------------------------------
+      - name: Verify signed IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          "$SIDESIGN" verify \
+            "$GITHUB_WORKSPACE/SideInstaller.ipa" \
+            --deep
+
+      # ------------------------------------------------------------
+      # Verify with Apple's codesign as an additional check
+      # ------------------------------------------------------------
+      - name: Verify application signature
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$RUNNER_TEMP/verify"
+          mkdir -p "$RUNNER_TEMP/verify"
+
+          unzip -q \
+            "$GITHUB_WORKSPACE/SideInstaller.ipa" \
+            -d "$RUNNER_TEMP/verify"
+
+          VERIFY_APP="$RUNNER_TEMP/verify/Payload/SideInstaller.app"
+
+          codesign \
+            --verify \
+            --deep \
+            --strict \
+            --verbose=4 \
+            "$VERIFY_APP"
+
+          codesign \
+            -dvv \
+            "$VERIFY_APP" \
+            2>&1 | head -n 30
+
+      # ------------------------------------------------------------
+      # Upload final IPA
+      # ------------------------------------------------------------
+      - name: Upload signed IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideInstaller-signed
+          path: SideInstaller.ipa
+          if-no-files-found: error
+
+      # ------------------------------------------------------------
+      # Cleanup
+      # ------------------------------------------------------------
+      - name: Cleanup secrets and temporary signing material
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          rm -f "$RUNNER_TEMP/SideStore.p12"
+          rm -f "$RUNNER_TEMP/SideInstaller.mobileprovision"
+          rm -f "$RUNNER_TEMP/SideInstaller-unsigned.ipa"
+
+          if [ -n "${RUNNER_TEMP:-}" ]; then
+            security delete-keychain \
+              "$RUNNER_TEMP/sidesign.keychain-db" \
+              2>/dev/null || true
+          fi
